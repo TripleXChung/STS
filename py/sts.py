@@ -2,11 +2,12 @@ import os
 import redis
 import time
 import datetime
+import collections
 import cPickle as pickle
 import simplejson as json
 
 datas = {}
-persistent = False
+persistent = True
 client = redis.Redis(host='localhost', port=6379, db=0)
 
 def publish_avg(server, timestamp, avg):
@@ -15,47 +16,28 @@ def publish_avg(server, timestamp, avg):
 	client.publish('avg', msg)
 	#print msg
 
-def get_file_path(server_string):
-	base_dir = 'data/' + server_string[:1]
-	if(os.path.exists(base_dir) == False):
-		os.mkdir(base_dir)
-	base_dir = base_dir + '/' + server_string[1:2]
-	if(os.path.exists(base_dir) == False):
-		os.mkdir(base_dir)
-
-	file_path = base_dir + '/' + server_string
-	return file_path
-
 def load_data(server_string):
 	global datas
-	if(datas.has_key(server_string)):
-		return datas[server_string]
-	return []
-
-def store_data(data, server_string):
-	global datas
-	datas[server_string] = data
+	if(not datas.has_key(server_string)):
+		datas[server_string] = collections.deque([])
+	return datas[server_string]
 
 def load_persistent_data(server_string):
-	file_path = get_file_path(server_string)
-	try:
-		fd = open(file_path, 'r')
-		data = pickle.load(fd)
-		fd.close()
-	except Exception,e:
-		data = []
-	return data
-
-def store_persistent_data(data, server_string):
-	file_path = get_file_path(server_string)
-	try:
-		fd = open(file_path, 'w')
-		pickle.dump(data, fd)
-		fd.close()
-	except Exception,e:
-		print e
+	global client
+	if(datas.has_key(server_string)):
+		return datas[server_string]
+	l = client.llen(server_string)
+	res = collections.deque([])
+	if(l > 0):
+		tmps = client.lrange(server_string, 0, l)
+		for tmp in tmps:
+			obj = pickle.loads(tmp)
+			res.append(obj)
+	datas[server_string] = res
+	return res
 
 def apply_value(server, timestamp, value):
+	global client
 	global persistent
 	if(type(server) != int):
 		return
@@ -73,14 +55,25 @@ def apply_value(server, timestamp, value):
 		data = load_data(server_string)
 
 	data.append(obj)
-
-	new_data = []
+	if(persistent):
+		client.rpush(server_string, pickle.dumps(obj))
+	"""new_data = []
 	last_timestamp = timestamp
 	for obj in data:
 		timestamp = obj[0]
 		if(last_timestamp - timestamp < (30 * 24 * 3600)):
 			new_data.append(obj)
-	data = new_data
+	data = new_data"""
+	last_timestamp = timestamp
+	while True:
+		obj = data[0]
+		timestamp = obj[0]
+		if(last_timestamp - timestamp > (30 * 24 * 3600)):
+			data.popleft()
+			if(persistent):
+				client.lpop(server_string)
+		else:
+			break
 
 	count = 0
 	total = 0
@@ -90,11 +83,6 @@ def apply_value(server, timestamp, value):
 	avg = total / count
 	#print server_string + '--' + str(count)
 	publish_avg(server, last_timestamp, avg)
-
-	if(persistent):
-		store_persistent_data(data, server_string)
-	else:
-		store_data(data, server_string)
 
 def handle_request(req):
 	if(type(req) != type([])):
@@ -121,10 +109,9 @@ def profile():
 	profile_count = 0
 
 if __name__ == '__main__':
-	pubsub = client.pubsub()
+	subclient = redis.Redis(host='localhost', port=6379, db=0)
+	pubsub = subclient.pubsub()
 	pubsub.psubscribe('event')
-	if(os.path.exists('data') == False):
-		os.mkdir('data')
 	while True:
 		msg = pubsub.listen().next()
 		channel = msg['channel']
