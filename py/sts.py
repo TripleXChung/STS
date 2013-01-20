@@ -7,7 +7,8 @@ import cPickle as pickle
 import simplejson as json
 
 datas = {}
-persistent = True
+totals = {}
+persistent = False
 client = redis.Redis(host='localhost', port=6379, db=0)
 
 def publish_avg(server, timestamp, avg):
@@ -16,24 +17,28 @@ def publish_avg(server, timestamp, avg):
 	client.publish('avg', msg)
 	#print msg
 
-def load_data(server_string):
+def load_data(server):
 	global datas
-	if(not datas.has_key(server_string)):
-		datas[server_string] = collections.deque([])
-	return datas[server_string]
+	if(not datas.has_key(server)):
+		datas[server] = collections.deque([])
+		totals[server] = 0
+	return datas[server]
 
-def load_persistent_data(server_string):
+def load_persistent_data(server):
 	global client
-	if(datas.has_key(server_string)):
-		return datas[server_string]
-	l = client.llen(server_string)
+	if(datas.has_key(server)):
+		return datas[server]
+	l = client.llen(server)
 	res = collections.deque([])
+	total = 0
 	if(l > 0):
-		tmps = client.lrange(server_string, 0, l)
+		tmps = client.lrange(server, 0, l)
 		for tmp in tmps:
 			obj = pickle.loads(tmp)
 			res.append(obj)
-	datas[server_string] = res
+			total = total + obj[1]
+	totals[server] = total
+	datas[server] = res
 	return res
 
 def apply_value(server, timestamp, value):
@@ -41,7 +46,7 @@ def apply_value(server, timestamp, value):
 	global persistent
 	if(type(server) != int):
 		return
-	server_string = "%2.2x"%(server)
+	#server_string = "%2.2x"%(server)
 
 	if(type(timestamp) != int):
 		return
@@ -50,13 +55,16 @@ def apply_value(server, timestamp, value):
 	obj = [timestamp, value]
 	
 	if(persistent):
-		data = load_persistent_data(server_string)
+		data = load_persistent_data(server)
 	else:
-		data = load_data(server_string)
+		data = load_data(server)
 
 	data.append(obj)
+	totals[server] = totals[server] + obj[1]
+	total = totals[server]
+
 	if(persistent):
-		client.rpush(server_string, pickle.dumps(obj))
+		client.rpush(server, pickle.dumps(obj))
 	"""new_data = []
 	last_timestamp = timestamp
 	for obj in data:
@@ -64,6 +72,7 @@ def apply_value(server, timestamp, value):
 		if(last_timestamp - timestamp < (30 * 24 * 3600)):
 			new_data.append(obj)
 	data = new_data"""
+	
 	last_timestamp = timestamp
 	while True:
 		obj = data[0]
@@ -71,15 +80,12 @@ def apply_value(server, timestamp, value):
 		if(last_timestamp - timestamp > (30 * 24 * 3600)):
 			data.popleft()
 			if(persistent):
-				client.lpop(server_string)
+				client.lpop(server)
+			totals[server] = totals[server] - obj[1]
+			total = totals[server]
 		else:
 			break
-
-	count = 0
-	total = 0
-	for obj in data:
-		total = total + obj[1]
-		count = count + 1
+	count = len(datas)
 	avg = total / count
 	#print server_string + '--' + str(count)
 	publish_avg(server, last_timestamp, avg)
